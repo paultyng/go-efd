@@ -2,23 +2,29 @@
 package efd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
+	"log"
 	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"golang.org/x/net/html"
 	"golang.org/x/net/publicsuffix"
-
-	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/time/rate"
 )
 
 var csrfCharset []rune = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
@@ -72,6 +78,8 @@ type anchorData struct {
 // EFDClient is a wrapper struct containing state and parameters
 // for interacting with the efdsearch system
 type EFDClient struct {
+	limiter *rate.Limiter
+
 	jar           http.CookieJar
 	client        *http.Client
 	baseURL       *url.URL
@@ -80,6 +88,8 @@ type EFDClient struct {
 	searchDataURL *url.URL
 	userAgent     string
 	dateLayout    string
+
+	cacheDir string
 
 	// Indicates whether we have the cookies accepting the ToS
 	authed bool
@@ -103,6 +113,14 @@ func CreateEFDClient(userAgent string, dateLayout string) EFDClient {
 	c.initParam(userAgent, dateLayout)
 
 	return c
+}
+
+func (c *EFDClient) SetLimiter(limiter *rate.Limiter) {
+	c.limiter = limiter
+}
+
+func (c *EFDClient) SetCacheDir(cacheDir string) {
+	c.cacheDir = cacheDir
 }
 
 // initParam is an initializer function for an EFDClient struct, it sets up some parameters of the client
@@ -135,8 +153,8 @@ func (c *EFDClient) initParam(userAgent string, dateLayout string) {
 // AcceptDisclaimer goes through the process of accepting the initial disclaimer
 // and setting up session data for report retrieval
 // This doesn't need to be called explicitly, but can be
-func (c *EFDClient) AcceptDisclaimer() error {
-	csrftoken, err := c.parseCSRFToken(c.homeURL)
+func (c *EFDClient) AcceptDisclaimer(ctx context.Context) error {
+	csrftoken, err := c.parseCSRFToken(ctx, c.homeURL)
 	if err != nil {
 		return err
 	}
@@ -145,7 +163,7 @@ func (c *EFDClient) AcceptDisclaimer() error {
 	data.Set("prohibition_agreement", "1")
 	data.Set("csrfmiddlewaretoken", csrftoken)
 
-	req, err := http.NewRequest("POST", c.homeURL.String(), strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.homeURL.String(), strings.NewReader(data.Encode()))
 	if err != nil {
 		return err
 	}
@@ -155,6 +173,12 @@ func (c *EFDClient) AcceptDisclaimer() error {
 	req.Header.Add("Content-Length", strconv.Itoa(len(data.Encode())))
 	req.Header.Add("User-Agent", c.userAgent)
 
+	if c.limiter != nil {
+		err = c.limiter.Wait(ctx)
+		if err != nil {
+			return err
+		}
+	}
 	_, err = c.client.Do(req)
 	if err != nil {
 		return err
@@ -166,12 +190,12 @@ func (c *EFDClient) AcceptDisclaimer() error {
 }
 
 // SearchSenatorPTR is a wrapper around searchReportData which retrieves a list of Senator's PTRs for a given timeframe
-func (c *EFDClient) SearchSenatorPTR(startTime time.Time, endTime time.Time) ([]SearchResult, error) {
-	return c.SearchReportData("", "", []FilerType{SenatorFiler}, "", []ReportType{PeriodicTransactionReport}, startTime, endTime)
+func (c *EFDClient) SearchSenatorPTR(ctx context.Context, startTime time.Time, endTime time.Time) ([]SearchResult, error) {
+	return c.SearchReportData(ctx, "", "", []FilerType{SenatorFiler}, "", []ReportType{PeriodicTransactionReport}, startTime, endTime)
 }
 
 // SearchReportData is a wrapper around searchReportDataPaged which automatically iterates over the full number of results
-func (c *EFDClient) SearchReportData(firstName string, lastName string, filerTypes []FilerType, state string, reportTypes []ReportType,
+func (c *EFDClient) SearchReportData(ctx context.Context, firstName string, lastName string, filerTypes []FilerType, state string, reportTypes []ReportType,
 	startTime time.Time, endTime time.Time) ([]SearchResult, error) {
 	var finalResults []SearchResult
 	var err error
@@ -183,7 +207,7 @@ func (c *EFDClient) SearchReportData(firstName string, lastName string, filerTyp
 	// As long as (Total records - start - length) > 0, we have more records to read
 	for remainder > 0 {
 		var results []SearchResult
-		results, remainder, err = c.searchReportDataPaged(firstName, lastName, filerTypes, state, reportTypes, startTime, endTime, start, length)
+		results, remainder, err = c.searchReportDataPaged(ctx, firstName, lastName, filerTypes, state, reportTypes, startTime, endTime, start, length)
 		if err != nil {
 			return nil, err
 		}
@@ -200,7 +224,7 @@ func (c *EFDClient) SearchReportData(firstName string, lastName string, filerTyp
 // For both Time inputs, only Day, Month, and Year will be used
 // start and length indicate the result number to start from and length to go
 // Returns search results, number of records remaining, and error status
-func (c *EFDClient) searchReportDataPaged(firstName string, lastName string, filerTypes []FilerType, state string, reportTypes []ReportType,
+func (c *EFDClient) searchReportDataPaged(ctx context.Context, firstName string, lastName string, filerTypes []FilerType, state string, reportTypes []ReportType,
 	startTime time.Time, endTime time.Time, start int, length int) ([]SearchResult, int, error) {
 	csrfToken := c.genCSRFToken()
 
@@ -233,7 +257,7 @@ func (c *EFDClient) searchReportDataPaged(firstName string, lastName string, fil
 	// CSRF token
 	data.Set("csrftoken", csrfToken)
 
-	req, err := http.NewRequest("POST", c.searchDataURL.String(), strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", c.searchDataURL.String(), strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -245,6 +269,12 @@ func (c *EFDClient) searchReportDataPaged(firstName string, lastName string, fil
 	req.Header.Add("X-CSRFToken", csrfToken)
 	req.AddCookie(&http.Cookie{Name: "csrftoken", Value: csrfToken})
 
+	if c.limiter != nil {
+		err = c.limiter.Wait(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -340,18 +370,47 @@ func (c *EFDClient) HandleResult(result SearchResult) (ParsedReport, error) {
 func (c *EFDClient) HandlePTRSearchResult(result SearchResult) ([]Transaction, error) {
 	var ptrTransactions []Transaction
 	var err error
+	cacheFile := path.Join(c.cacheDir, "ptr", fmt.Sprintf("%s.json", result.ReportID))
+
+	if c.cacheDir != "" {
+		f, err := os.Open(cacheFile)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("error opening cache file %q: %w", cacheFile, err)
+		}
+		if err == nil {
+			data, err := io.ReadAll(f)
+			if err != nil {
+				return nil, fmt.Errorf("error reading cache file %q: %w", cacheFile, err)
+			}
+			err = json.Unmarshal(data, &ptrTransactions)
+			if err != nil {
+				return nil, fmt.Errorf("error unmarshalling cache file: %w", err)
+			}
+			return ptrTransactions, nil
+		}
+	}
 
 	if !c.authed {
-		err = c.AcceptDisclaimer()
+		err = c.AcceptDisclaimer(context.TODO())
+		if err != nil {
+			return nil, fmt.Errorf("error accepting disclaimer: %w", err)
+		}
+	}
+
+	if c.limiter != nil {
+		err = c.limiter.Wait(context.TODO())
 		if err != nil {
 			return nil, err
 		}
 	}
-
 	resp, err := c.client.Get(result.FileURL.String())
-	if err != nil || resp.StatusCode == http.StatusForbidden {
+	if err != nil {
 		c.authed = false
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		c.authed = false
+		return nil, fmt.Errorf("forbidden: %s", result.FileURL.String())
 	}
 
 	defer resp.Body.Close()
@@ -416,6 +475,24 @@ func (c *EFDClient) HandlePTRSearchResult(result SearchResult) ([]Transaction, e
 		}
 	}
 
+	if c.cacheDir != "" {
+		log.Printf("caching new document for %s (%s)", result.ReportID, result.FullName)
+		dir := filepath.Dir(cacheFile)
+		err = os.MkdirAll(dir, 0755)
+		if err != nil {
+			return nil, fmt.Errorf("error creating cache directory %q: %w", dir, err)
+		}
+
+		cacheJSON, err := json.Marshal(ptrFiltered)
+		if err != nil {
+			return nil, fmt.Errorf("error marshalling cache data: %w", err)
+		}
+		err = os.WriteFile(cacheFile, cacheJSON, 0644)
+		if err != nil {
+			return nil, fmt.Errorf("error writing cache file %q: %w", cacheFile, err)
+		}
+	}
+
 	return ptrFiltered, nil
 }
 
@@ -429,12 +506,18 @@ func (c *EFDClient) HandleAnnualSearchResult(result SearchResult) ([]Transaction
 	var err error
 
 	if !c.authed {
-		err = c.AcceptDisclaimer()
+		err = c.AcceptDisclaimer(context.TODO())
 		if err != nil {
 			return nil, err
 		}
 	}
 
+	if c.limiter != nil {
+		err = c.limiter.Wait(context.TODO())
+		if err != nil {
+			return nil, err
+		}
+	}
 	resp, err := c.client.Get(result.FileURL.String())
 	if err != nil || resp.StatusCode == http.StatusForbidden {
 		c.authed = false
@@ -574,7 +657,7 @@ func (c *EFDClient) HandlePaperSearchResult(result SearchResult) (PaperReport, e
 	var err error
 
 	if !c.authed {
-		err = c.AcceptDisclaimer()
+		err = c.AcceptDisclaimer(context.TODO())
 		if err != nil {
 			return paperReport, err
 		}
@@ -584,6 +667,12 @@ func (c *EFDClient) HandlePaperSearchResult(result SearchResult) (PaperReport, e
 	fileURL := result.FileURL
 	fileURL.Path = strings.Replace(fileURL.Path, "view", "print", 1)
 
+	if c.limiter != nil {
+		err = c.limiter.Wait(context.TODO())
+		if err != nil {
+			return paperReport, err
+		}
+	}
 	resp, err := c.client.Get(fileURL.String())
 	if err != nil || resp.StatusCode == http.StatusForbidden {
 		c.authed = false
@@ -758,16 +847,22 @@ func (c EFDClient) genCSRFToken() string {
 
 // parseCSRFToken parses the `csrfmiddlewaretoken` field from pages with form data
 // On success, the token string will be returned
-func (c EFDClient) parseCSRFToken(url *url.URL) (string, error) {
+func (c EFDClient) parseCSRFToken(ctx context.Context, url *url.URL) (string, error) {
 	var csrftoken string = ""
 
-	req, err := http.NewRequest("GET", url.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url.String(), nil)
 	if err != nil {
 		return csrftoken, err
 	}
 
 	req.Header.Add("User-Agent", c.userAgent)
 
+	if c.limiter != nil {
+		err = c.limiter.Wait(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return "", err
