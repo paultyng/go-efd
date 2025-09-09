@@ -377,6 +377,7 @@ func (c *EFDClient) HandlePTRSearchResult(result SearchResult) ([]Transaction, e
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("error opening cache file %q: %w", cacheFile, err)
 		}
+		defer f.Close()
 		if err == nil {
 			data, err := io.ReadAll(f)
 			if err != nil {
